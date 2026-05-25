@@ -23,7 +23,6 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
-#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -45,7 +44,6 @@ struct Options {
   fs::path out_keyframes_tum;
   fs::path keyframe_csv;
   bool export_all_frames = true;
-  double max_time_diff = 1e-6;
 };
 
 struct TumPose {
@@ -64,7 +62,7 @@ void print_usage() {
   std::cerr << "Usage: glim_pcd_tum_backend "
             << "--pcd_dir DIR --tum scan_states_odom.txt --config_path CONFIG_DIR --out_tum OUT.tum "
             << "[--out_keyframes_tum OUT_KEYFRAMES.tum] [--keyframe_index_csv keyframe_index_to_input_index.csv] "
-            << "[--export_all_frames true|false] [--max_time_diff SEC]" << std::endl;
+            << "[--export_all_frames true|false]" << std::endl;
 }
 
 bool parse_bool(const std::string& text) {
@@ -102,8 +100,6 @@ Options parse_args(int argc, char** argv) {
       opts.keyframe_csv = require_value(key);
     } else if (key == "--export_all_frames") {
       opts.export_all_frames = parse_bool(require_value(key));
-    } else if (key == "--max_time_diff") {
-      opts.max_time_diff = std::stod(require_value(key));
     } else if (key == "--help" || key == "-h") {
       print_usage();
       std::exit(0);
@@ -205,30 +201,9 @@ std::vector<PcdEntry> load_pcd_list(const fs::path& dir) {
 const TumPose* find_pose(
   const PcdEntry& pcd,
   const std::vector<TumPose>& poses,
-  const std::unordered_map<std::string, size_t>& exact_pose_indices,
-  double max_time_diff) {
+  const std::unordered_map<std::string, size_t>& exact_pose_indices) {
   const auto exact = exact_pose_indices.find(pcd.stamp_text);
-  if (exact != exact_pose_indices.end()) {
-    return &poses[exact->second];
-  }
-
-  const auto lower = std::lower_bound(poses.begin(), poses.end(), pcd.stamp, [](const TumPose& pose, double stamp) { return pose.stamp < stamp; });
-  const TumPose* best = nullptr;
-  double best_dt = std::numeric_limits<double>::max();
-  if (lower != poses.end()) {
-    best = &*lower;
-    best_dt = std::abs(lower->stamp - pcd.stamp);
-  }
-  if (lower != poses.begin()) {
-    const auto prev = std::prev(lower);
-    const double dt = std::abs(prev->stamp - pcd.stamp);
-    if (dt < best_dt) {
-      best = &*prev;
-      best_dt = dt;
-    }
-  }
-
-  return best && best_dt <= max_time_diff ? best : nullptr;
+  return exact != exact_pose_indices.end() ? &poses[exact->second] : nullptr;
 }
 
 glim::RawPoints::Ptr load_raw_points(const PcdEntry& pcd, double stamp) {
@@ -284,14 +259,26 @@ glim::EstimationFrame::Ptr create_estimation_frame(
   frame->frame = cloud;
 
   frame->custom_data["input_index"] = std::shared_ptr<void>(new int(input_index), [](void* p) { delete static_cast<int*>(p); });
+  frame->custom_data["stamp_text"] = std::shared_ptr<void>(new std::string(pose.stamp_text), [](void* p) { delete static_cast<std::string*>(p); });
   return frame;
 }
 
-void write_tum_frame(std::ofstream& ofs, double stamp, const Eigen::Isometry3d& pose) {
+std::string format_stamp(double stamp) {
+  std::ostringstream oss;
+  oss << std::fixed << std::setprecision(9) << stamp;
+  return oss.str();
+}
+
+std::string stamp_text_of(const glim::EstimationFrame::ConstPtr& frame) {
+  const std::string* stamp_text = frame->get_custom_data<std::string>("stamp_text");
+  return stamp_text ? *stamp_text : format_stamp(frame->stamp);
+}
+
+void write_tum_frame(std::ofstream& ofs, const std::string& stamp_text, const Eigen::Isometry3d& pose) {
   Eigen::Quaterniond q(pose.linear());
   q.normalize();
   const Eigen::Vector3d t = pose.translation();
-  ofs << std::fixed << std::setprecision(9) << stamp << " " << std::setprecision(6) << t.x() << " " << t.y() << " " << t.z() << " " << q.x() << " " << q.y()
+  ofs << stamp_text << " " << std::fixed << std::setprecision(6) << t.x() << " " << t.y() << " " << t.z() << " " << q.x() << " " << q.y()
       << " " << q.z() << " " << q.w() << "\n";
 }
 
@@ -326,8 +313,9 @@ void write_submap_origin_outputs(const std::vector<glim::SubMap::Ptr>& submaps, 
       continue;
     }
     const auto origin = submap->origin_frame();
-    write_tum_frame(tum, origin->stamp, submap->T_world_origin);
-    csv << i << "," << input_index_of(origin) << "," << std::fixed << std::setprecision(9) << origin->stamp << "\n";
+    const std::string stamp_text = stamp_text_of(origin);
+    write_tum_frame(tum, stamp_text, submap->T_world_origin);
+    csv << i << "," << input_index_of(origin) << "," << stamp_text << "\n";
   }
 }
 
@@ -347,7 +335,7 @@ void write_all_frame_outputs(const std::vector<glim::SubMap::Ptr>& submaps, cons
     const Eigen::Isometry3d T_odom_lidar0 = submap->frames.front()->T_world_lidar;
     for (const auto& frame : submap->frames) {
       const Eigen::Isometry3d T_world_lidar = T_world_endpoint_L * T_odom_lidar0.inverse() * frame->T_world_lidar;
-      write_tum_frame(tum, frame->stamp, T_world_lidar);
+      write_tum_frame(tum, stamp_text_of(frame), T_world_lidar);
     }
   }
 }
@@ -407,7 +395,7 @@ int main(int argc, char** argv) {
     int skipped_without_pose = 0;
     glim::EstimationFrame::Ptr last_inserted_frame;
     for (size_t i = 0; i < pcds.size(); i++) {
-      const TumPose* pose = find_pose(pcds[i], poses, exact_pose_indices, opts.max_time_diff);
+      const TumPose* pose = find_pose(pcds[i], poses, exact_pose_indices);
       if (!pose) {
         skipped_without_pose++;
         continue;
