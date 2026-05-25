@@ -27,6 +27,7 @@ find_package(Eigen3 REQUIRED)
 find_package(GTSAM 4.2 REQUIRED)
 find_package(gtsam_points 1.2.0 REQUIRED)
 find_package(OpenMP REQUIRED)
+find_package(PCL REQUIRED COMPONENTS common io)
 find_package(spdlog REQUIRED)
 
 if(BUILD_WITH_VIEWER)
@@ -119,6 +120,18 @@ if(BUILD_WITH_OPENCV)
   target_compile_definitions(glim PUBLIC GLIM_USE_OPENCV)
 endif()
 list(APPEND glim_LIBRARIES glim)
+
+add_executable(glim_pcd_tum_backend
+  src/glim/tools/pcd_tum_backend.cpp
+)
+target_include_directories(glim_pcd_tum_backend PRIVATE
+  ${PCL_INCLUDE_DIRS}
+)
+target_link_libraries(glim_pcd_tum_backend
+  glim
+  ${PCL_LIBRARIES}
+)
+target_compile_options(glim_pcd_tum_backend PRIVATE ${PCL_DEFINITIONS})
 
 # Create shared libraries for estimation modules
 list(APPEND module_srcs
@@ -229,6 +242,15 @@ install(TARGETS ${glim_LIBRARIES}
   ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
   RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
+if("$ENV{ROS_VERSION}" STREQUAL "2")
+  install(TARGETS glim_pcd_tum_backend
+    RUNTIME DESTINATION lib/${PROJECT_NAME}
+  )
+else()
+  install(TARGETS glim_pcd_tum_backend
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+  )
+endif()
 include(CMakePackageConfigHelpers)
 install(EXPORT glim-targets
   FILE glim-targets.cmake
