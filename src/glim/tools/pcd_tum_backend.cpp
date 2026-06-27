@@ -9,16 +9,14 @@
 
 #include <gtsam_points/types/point_cloud_cpu.hpp>
 
-#include <pcl/io/pcd_io.h>
-#include <pcl/point_cloud.h>
-#include <pcl/point_types.h>
-
 #include <Eigen/Core>
 #include <Eigen/Geometry>
 
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -56,6 +54,17 @@ struct PcdEntry {
   fs::path path;
   std::string stamp_text;
   double stamp = 0.0;
+};
+
+struct PcdHeader {
+  std::vector<std::string> fields;
+  std::vector<int> sizes;
+  std::vector<char> types;
+  std::vector<int> counts;
+  std::string data_type;
+  size_t points = 0;
+  size_t point_step = 0;
+  std::unordered_map<std::string, size_t> offsets;
 };
 
 void print_usage() {
@@ -198,6 +207,322 @@ std::vector<PcdEntry> load_pcd_list(const fs::path& dir) {
   return entries;
 }
 
+std::vector<std::string> split_tokens(const std::string& line) {
+  std::istringstream iss(line);
+  std::vector<std::string> tokens;
+  std::string token;
+  while (iss >> token) {
+    tokens.push_back(token);
+  }
+  return tokens;
+}
+
+PcdHeader read_pcd_header(std::ifstream& ifs, const fs::path& path) {
+  PcdHeader header;
+  std::string line;
+  size_t width = 0;
+  size_t height = 1;
+
+  while (std::getline(ifs, line)) {
+    if (!line.empty() && line.back() == '\r') {
+      line.pop_back();
+    }
+    if (line.empty() || line.front() == '#') {
+      continue;
+    }
+
+    const auto tokens = split_tokens(line);
+    if (tokens.empty()) {
+      continue;
+    }
+
+    const std::string& key = tokens.front();
+    if (key == "FIELDS") {
+      header.fields.assign(tokens.begin() + 1, tokens.end());
+    } else if (key == "SIZE") {
+      header.sizes.clear();
+      for (size_t i = 1; i < tokens.size(); i++) {
+        header.sizes.push_back(std::stoi(tokens[i]));
+      }
+    } else if (key == "TYPE") {
+      header.types.clear();
+      for (size_t i = 1; i < tokens.size(); i++) {
+        if (tokens[i].empty()) {
+          throw std::runtime_error("empty TYPE token in PCD header: " + path.string());
+        }
+        header.types.push_back(tokens[i].front());
+      }
+    } else if (key == "COUNT") {
+      header.counts.clear();
+      for (size_t i = 1; i < tokens.size(); i++) {
+        header.counts.push_back(std::stoi(tokens[i]));
+      }
+    } else if (key == "WIDTH" && tokens.size() >= 2) {
+      width = static_cast<size_t>(std::stoull(tokens[1]));
+    } else if (key == "HEIGHT" && tokens.size() >= 2) {
+      height = static_cast<size_t>(std::stoull(tokens[1]));
+    } else if (key == "POINTS" && tokens.size() >= 2) {
+      header.points = static_cast<size_t>(std::stoull(tokens[1]));
+    } else if (key == "DATA" && tokens.size() >= 2) {
+      header.data_type = tokens[1];
+      break;
+    }
+  }
+
+  if (header.fields.empty() || header.sizes.empty() || header.types.empty() || header.data_type.empty()) {
+    throw std::runtime_error("incomplete PCD header: " + path.string());
+  }
+  if (header.counts.empty()) {
+    header.counts.assign(header.fields.size(), 1);
+  }
+  if (header.fields.size() != header.sizes.size() || header.fields.size() != header.types.size() || header.fields.size() != header.counts.size()) {
+    throw std::runtime_error("inconsistent PCD header field metadata: " + path.string());
+  }
+  if (header.points == 0 && width != 0 && height != 0) {
+    header.points = width * height;
+  }
+  if (header.points == 0) {
+    throw std::runtime_error("PCD has zero POINTS: " + path.string());
+  }
+
+  size_t offset = 0;
+  for (size_t i = 0; i < header.fields.size(); i++) {
+    if (header.sizes[i] <= 0 || header.counts[i] <= 0) {
+      throw std::runtime_error("invalid PCD field size/count: " + path.string());
+    }
+    header.offsets.emplace(header.fields[i], offset);
+    offset += static_cast<size_t>(header.sizes[i]) * static_cast<size_t>(header.counts[i]);
+  }
+  header.point_step = offset;
+  return header;
+}
+
+uint32_t read_u32_le(std::ifstream& ifs, const fs::path& path) {
+  unsigned char bytes[4] = {};
+  ifs.read(reinterpret_cast<char*>(bytes), sizeof(bytes));
+  if (ifs.gcount() != static_cast<std::streamsize>(sizeof(bytes))) {
+    throw std::runtime_error("failed to read compressed PCD size header: " + path.string());
+  }
+  return static_cast<uint32_t>(bytes[0]) | (static_cast<uint32_t>(bytes[1]) << 8) | (static_cast<uint32_t>(bytes[2]) << 16) |
+         (static_cast<uint32_t>(bytes[3]) << 24);
+}
+
+float read_float_le(const unsigned char* bytes) {
+  uint32_t raw = static_cast<uint32_t>(bytes[0]) | (static_cast<uint32_t>(bytes[1]) << 8) | (static_cast<uint32_t>(bytes[2]) << 16) |
+                 (static_cast<uint32_t>(bytes[3]) << 24);
+  float value = 0.0f;
+  std::memcpy(&value, &raw, sizeof(value));
+  return value;
+}
+
+bool lzf_decompress(const std::vector<unsigned char>& input, std::vector<unsigned char>& output) {
+  const unsigned char* ip = input.data();
+  const unsigned char* const in_end = input.data() + input.size();
+  unsigned char* op = output.data();
+  unsigned char* const out_start = output.data();
+  unsigned char* const out_end = output.data() + output.size();
+
+  while (ip < in_end) {
+    unsigned int ctrl = *ip++;
+    if (ctrl < 32) {
+      ctrl += 1;
+      if (ip + ctrl > in_end || op + ctrl > out_end) {
+        return false;
+      }
+      std::memcpy(op, ip, ctrl);
+      op += ctrl;
+      ip += ctrl;
+    } else {
+      unsigned int len = ctrl >> 5;
+      unsigned char* ref = op - ((ctrl & 0x1f) << 8) - 1;
+      if (len == 7) {
+        if (ip >= in_end) {
+          return false;
+        }
+        len += *ip++;
+      }
+      if (ip >= in_end) {
+        return false;
+      }
+      ref -= *ip++;
+      len += 2;
+      if (ref < out_start || op + len > out_end) {
+        return false;
+      }
+      while (len--) {
+        *op++ = *ref++;
+      }
+    }
+  }
+
+  return op == out_end;
+}
+
+void require_float_field(const PcdHeader& header, const std::string& field, const fs::path& path) {
+  const auto found = header.offsets.find(field);
+  if (found == header.offsets.end()) {
+    throw std::runtime_error("PCD is missing required field '" + field + "': " + path.string());
+  }
+  const auto index = static_cast<size_t>(std::find(header.fields.begin(), header.fields.end(), field) - header.fields.begin());
+  if (header.sizes[index] != 4 || header.types[index] != 'F' || header.counts[index] != 1) {
+    throw std::runtime_error("PCD field '" + field + "' must be a scalar float32: " + path.string());
+  }
+}
+
+glim::RawPoints::Ptr raw_points_from_aos(const PcdHeader& header, const std::vector<unsigned char>& data, const fs::path& path, double stamp) {
+  const size_t x_offset = header.offsets.at("x");
+  const size_t y_offset = header.offsets.at("y");
+  const size_t z_offset = header.offsets.at("z");
+  const auto intensity_offset = header.offsets.find("intensity");
+
+  auto raw = std::make_shared<glim::RawPoints>();
+  raw->stamp = stamp;
+  raw->points.reserve(header.points);
+  raw->times.reserve(header.points);
+  raw->intensities.reserve(header.points);
+
+  for (size_t i = 0; i < header.points; i++) {
+    const size_t base = i * header.point_step;
+    const float x = read_float_le(data.data() + base + x_offset);
+    const float y = read_float_le(data.data() + base + y_offset);
+    const float z = read_float_le(data.data() + base + z_offset);
+    if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) {
+      continue;
+    }
+    raw->points.emplace_back(x, y, z, 1.0);
+    raw->times.emplace_back(0.0);
+    if (intensity_offset != header.offsets.end()) {
+      raw->intensities.emplace_back(read_float_le(data.data() + base + intensity_offset->second));
+    } else {
+      raw->intensities.emplace_back(0.0f);
+    }
+  }
+  return raw;
+}
+
+glim::RawPoints::Ptr raw_points_from_soa(const PcdHeader& header, const std::vector<unsigned char>& data, const fs::path& path, double stamp) {
+  const size_t x_offset = header.offsets.at("x");
+  const size_t y_offset = header.offsets.at("y");
+  const size_t z_offset = header.offsets.at("z");
+  const auto intensity_offset = header.offsets.find("intensity");
+
+  auto get_float = [&](size_t field_offset, size_t point_index) {
+    const size_t offset = field_offset * header.points + point_index * sizeof(float);
+    return read_float_le(data.data() + offset);
+  };
+
+  auto raw = std::make_shared<glim::RawPoints>();
+  raw->stamp = stamp;
+  raw->points.reserve(header.points);
+  raw->times.reserve(header.points);
+  raw->intensities.reserve(header.points);
+
+  for (size_t i = 0; i < header.points; i++) {
+    const float x = get_float(x_offset, i);
+    const float y = get_float(y_offset, i);
+    const float z = get_float(z_offset, i);
+    if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) {
+      continue;
+    }
+    raw->points.emplace_back(x, y, z, 1.0);
+    raw->times.emplace_back(0.0);
+    if (intensity_offset != header.offsets.end()) {
+      raw->intensities.emplace_back(get_float(intensity_offset->second, i));
+    } else {
+      raw->intensities.emplace_back(0.0f);
+    }
+  }
+  return raw;
+}
+
+glim::RawPoints::Ptr read_binary_pcd(std::ifstream& ifs, const PcdHeader& header, const fs::path& path, double stamp) {
+  const size_t bytes = header.point_step * header.points;
+  std::vector<unsigned char> data(bytes);
+  ifs.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(data.size()));
+  if (ifs.gcount() != static_cast<std::streamsize>(data.size())) {
+    throw std::runtime_error("failed to read binary PCD payload: " + path.string());
+  }
+  return raw_points_from_aos(header, data, path, stamp);
+}
+
+glim::RawPoints::Ptr read_binary_compressed_pcd(std::ifstream& ifs, const PcdHeader& header, const fs::path& path, double stamp) {
+  const uint32_t compressed_size = read_u32_le(ifs, path);
+  const uint32_t uncompressed_size = read_u32_le(ifs, path);
+  const size_t expected_size = header.point_step * header.points;
+  if (uncompressed_size != expected_size) {
+    throw std::runtime_error("unexpected PCD uncompressed payload size in " + path.string() + ": got " + std::to_string(uncompressed_size) +
+                             ", expected " + std::to_string(expected_size));
+  }
+
+  std::vector<unsigned char> compressed(compressed_size);
+  ifs.read(reinterpret_cast<char*>(compressed.data()), static_cast<std::streamsize>(compressed.size()));
+  if (ifs.gcount() != static_cast<std::streamsize>(compressed.size())) {
+    throw std::runtime_error("failed to read compressed PCD payload: " + path.string());
+  }
+
+  std::vector<unsigned char> decompressed(uncompressed_size);
+  if (!lzf_decompress(compressed, decompressed)) {
+    throw std::runtime_error("failed to LZF-decompress PCD payload: " + path.string());
+  }
+  return raw_points_from_soa(header, decompressed, path, stamp);
+}
+
+glim::RawPoints::Ptr read_ascii_pcd(std::ifstream& ifs, const PcdHeader& header, const fs::path& path, double stamp) {
+  std::vector<size_t> value_indices(header.fields.size(), 0);
+  size_t value_index = 0;
+  for (size_t i = 0; i < header.fields.size(); i++) {
+    value_indices[i] = value_index;
+    value_index += static_cast<size_t>(header.counts[i]);
+  }
+
+  const auto field_index = [&](const std::string& name) {
+    const auto iter = std::find(header.fields.begin(), header.fields.end(), name);
+    if (iter == header.fields.end()) {
+      throw std::runtime_error("PCD is missing required field '" + name + "': " + path.string());
+    }
+    return static_cast<size_t>(iter - header.fields.begin());
+  };
+
+  const size_t x_index = value_indices[field_index("x")];
+  const size_t y_index = value_indices[field_index("y")];
+  const size_t z_index = value_indices[field_index("z")];
+  const auto intensity_field = std::find(header.fields.begin(), header.fields.end(), "intensity");
+  const bool has_intensity = intensity_field != header.fields.end();
+  const size_t intensity_index = has_intensity ? value_indices[static_cast<size_t>(intensity_field - header.fields.begin())] : 0;
+
+  auto raw = std::make_shared<glim::RawPoints>();
+  raw->stamp = stamp;
+  raw->points.reserve(header.points);
+  raw->times.reserve(header.points);
+  raw->intensities.reserve(header.points);
+
+  std::string line;
+  while (std::getline(ifs, line)) {
+    if (line.empty() || line.front() == '#') {
+      continue;
+    }
+    std::istringstream iss(line);
+    std::vector<float> values;
+    float value = 0.0f;
+    while (iss >> value) {
+      values.push_back(value);
+    }
+    if (values.size() <= std::max({x_index, y_index, z_index, has_intensity ? intensity_index : 0})) {
+      continue;
+    }
+    const float x = values[x_index];
+    const float y = values[y_index];
+    const float z = values[z_index];
+    if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) {
+      continue;
+    }
+    raw->points.emplace_back(x, y, z, 1.0);
+    raw->times.emplace_back(0.0);
+    raw->intensities.emplace_back(has_intensity ? values[intensity_index] : 0.0f);
+  }
+  return raw;
+}
+
 const TumPose* find_pose(
   const PcdEntry& pcd,
   const std::vector<TumPose>& poses,
@@ -207,26 +532,28 @@ const TumPose* find_pose(
 }
 
 glim::RawPoints::Ptr load_raw_points(const PcdEntry& pcd, double stamp) {
-  pcl::PointCloud<pcl::PointXYZI> cloud;
-  if (pcl::io::loadPCDFile<pcl::PointXYZI>(pcd.path.string(), cloud) < 0) {
-    throw std::runtime_error("failed to load PCD: " + pcd.path.string());
+  std::ifstream ifs(pcd.path, std::ios::binary);
+  if (!ifs) {
+    throw std::runtime_error("failed to open PCD: " + pcd.path.string());
+  }
+  const PcdHeader header = read_pcd_header(ifs, pcd.path);
+  require_float_field(header, "x", pcd.path);
+  require_float_field(header, "y", pcd.path);
+  require_float_field(header, "z", pcd.path);
+  if (header.offsets.count("intensity")) {
+    require_float_field(header, "intensity", pcd.path);
   }
 
-  auto raw = std::make_shared<glim::RawPoints>();
-  raw->stamp = stamp;
-  raw->points.reserve(cloud.size());
-  raw->times.reserve(cloud.size());
-  raw->intensities.reserve(cloud.size());
-
-  for (const auto& pt : cloud) {
-    if (!std::isfinite(pt.x) || !std::isfinite(pt.y) || !std::isfinite(pt.z)) {
-      continue;
-    }
-    raw->points.emplace_back(pt.x, pt.y, pt.z, 1.0);
-    raw->times.emplace_back(0.0);
-    raw->intensities.emplace_back(pt.intensity);
+  if (header.data_type == "binary_compressed") {
+    return read_binary_compressed_pcd(ifs, header, pcd.path, stamp);
   }
-  return raw;
+  if (header.data_type == "binary") {
+    return read_binary_pcd(ifs, header, pcd.path, stamp);
+  }
+  if (header.data_type == "ascii") {
+    return read_ascii_pcd(ifs, header, pcd.path, stamp);
+  }
+  throw std::runtime_error("unsupported PCD DATA type '" + header.data_type + "': " + pcd.path.string());
 }
 
 glim::EstimationFrame::Ptr create_estimation_frame(

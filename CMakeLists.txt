@@ -27,7 +27,6 @@ find_package(Eigen3 REQUIRED)
 find_package(GTSAM 4.2 REQUIRED)
 find_package(gtsam_points 1.2.0 REQUIRED)
 find_package(OpenMP REQUIRED)
-find_package(PCL REQUIRED COMPONENTS common io)
 find_package(spdlog REQUIRED)
 
 if(BUILD_WITH_VIEWER)
@@ -124,14 +123,9 @@ list(APPEND glim_LIBRARIES glim)
 add_executable(glim_pcd_tum_backend
   src/glim/tools/pcd_tum_backend.cpp
 )
-target_include_directories(glim_pcd_tum_backend PRIVATE
-  ${PCL_INCLUDE_DIRS}
-)
 target_link_libraries(glim_pcd_tum_backend
   glim
-  ${PCL_LIBRARIES}
 )
-target_compile_options(glim_pcd_tum_backend PRIVATE ${PCL_DEFINITIONS})
 
 # Create shared libraries for estimation modules
 list(APPEND module_srcs
